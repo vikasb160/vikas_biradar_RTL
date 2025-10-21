@@ -1,0 +1,17 @@
+services:
+  verif:
+    image: ghcr.io/hdl/sim/osvb
+    volumes:
+      - ./:/code
+    working_dir: /code/rundir/
+    command: >
+      sh -c "echo 'Compiling...'
+             iverilog -g2012 /code/rtl/*.v /code/verification/test_uart_rx.v
+             echo 'Executing...'
+             vvp a.out"
+
+  synth:
+    image: ghcr.io/hdl/impl/pnr
+    volumes:
+      - ./:/code
+    command: yosys -s /code/scripts/synth.tcl -l /code/rundir/synth.log
