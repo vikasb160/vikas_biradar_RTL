@@ -102,12 +102,11 @@ always @(posedge clk) begin
             if (bit_cnt > 1) begin
                 bit_cnt <= bit_cnt - 1;
                 prescale_reg <= (prescale << 3)-1;
-                txd_reg      <= data_reg[DATA_WIDTH];
-                data_reg     <= {data_reg[DATA_WIDTH-1:0], 1'b0};
+                {data_reg, txd_reg} <= {1'b0, data_reg};
             end else if (bit_cnt == 1) begin
                 bit_cnt <= bit_cnt - 1;
                 prescale_reg <= (prescale << 3);
-                txd_reg <= 0;
+                txd_reg <= 1;
             end
         end
     end
