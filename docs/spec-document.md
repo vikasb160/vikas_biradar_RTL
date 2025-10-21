@@ -32,8 +32,6 @@ The design implements **8N1 framing** (1 start bit, 8 data bits, 1 stop bit, no 
 
 * Detect start edge (`rxd == 0`), then wait roughly **½ bit** to re-sample near the bit center:
   `prescale_reg <= (prescale << 2) - 2`
-  // NOTE: sampling occurs one cycle after the counter reaches 0,
-  // so the effective first-sample time is (prescale << 2) - 1 cycles after the edge.
 * Subsequent samples occur every bit period:
   `prescale_reg <= (prescale << 3) - 1` (≈ `8*prescale - 1`)
 
@@ -295,4 +293,5 @@ module uart #(
 * **Synthesis:** Modules are Verilog-2001; no vendor primitives required.
 
 ---
+
 
