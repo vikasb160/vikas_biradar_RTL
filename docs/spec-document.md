@@ -30,8 +30,10 @@ The design implements **8N1 framing** (1 start bit, 8 data bits, 1 stop bit, no 
 
 ### Receive Sampling (8× oversample)
 
-* Detect start edge (`rxd == 0`), then wait roughly **½ bit** to re-sample center of the start bit:
-  `prescale_reg <= (prescale << 2) - 2` (≈ `4*prescale - 2`)
+* Detect start edge (`rxd == 0`), then wait roughly **½ bit** to re-sample near the bit center:
+  `prescale_reg <= (prescale << 2) - 2`
+  // NOTE: sampling occurs one cycle after the counter reaches 0,
+  // so the effective first-sample time is (prescale << 2) - 1 cycles after the edge.
 * Subsequent samples occur every bit period:
   `prescale_reg <= (prescale << 3) - 1` (≈ `8*prescale - 1`)
 
@@ -277,7 +279,7 @@ module uart #(
 | Bit time                | `T_bit = prescale * 8` clock cycles                            |
 | TX accept window        | Only when idle (`tready=1`)                                    |
 | TX frame duration       | `(DATA_WIDTH + 2) * T_bit` cycles                              |
-| RX start re-sample      | `(prescale<<2) - 2` cycles after start edge                    |
+| RX start re-sample      | `(prescale<<2) - 1` cycles after start edge                    |
 | RX inter-bit spacing    | `(prescale<<3) - 1` cycles                                     |
 | RX `m_axis_tvalid` hold | Until `m_axis_tready`                                          |
 | Overrun indication      | 1-cycle pulse on new-byte completion while previous `tvalid=1` |
@@ -293,3 +295,4 @@ module uart #(
 * **Synthesis:** Modules are Verilog-2001; no vendor primitives required.
 
 ---
+
