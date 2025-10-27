@@ -92,7 +92,7 @@ always @(posedge clk) begin
 
             if (s_axis_tvalid) begin
                 s_axis_tready_reg <= !s_axis_tready_reg;
-                prescale_reg <= (prescale << 3)-1;
+                prescale_reg <= (prescale << 3);
                 bit_cnt <= DATA_WIDTH+1;
                 data_reg <= {1'b1, s_axis_tdata};
                 txd_reg <= 0;
@@ -101,7 +101,7 @@ always @(posedge clk) begin
         end else begin
             if (bit_cnt > 1) begin
                 bit_cnt <= bit_cnt - 1;
-                prescale_reg <= (prescale << 3)-1;
+                prescale_reg <= (prescale << 3);
                 txd_reg      <= data_reg[DATA_WIDTH];
                 data_reg     <= {data_reg[DATA_WIDTH-1:0], 1'b0};
             end else if (bit_cnt == 1) begin
