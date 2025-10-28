@@ -1,0 +1,476 @@
+#Context
+
+\code\rtl\uart.v
+/*
+
+Copyright (c) 2014-2017 Alex Forencich
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+*/
+
+// Language: Verilog 2001
+
+`timescale 1ns / 1ps
+
+/*
+ * AXI4-Stream UART
+ */
+module uart #
+(
+    parameter DATA_WIDTH = 8
+)
+(
+    input  wire                   clk,
+    input  wire                   rst,
+
+    /*
+     * AXI input
+     */
+    input  wire [DATA_WIDTH-1:0]  s_axis_tdata,
+    input  wire                   s_axis_tvalid,
+    output wire                   s_axis_tready,
+
+    /*
+     * AXI output
+     */
+    output wire [DATA_WIDTH-1:0]  m_axis_tdata,
+    output wire                   m_axis_tvalid,
+    input  wire                   m_axis_tready,
+
+    /*
+     * UART interface
+     */
+    input  wire                   rxd,
+    output wire                   txd,
+
+    /*
+     * Status
+     */
+    output wire                   tx_busy,
+    output wire                   rx_busy,
+    output wire                   rx_overrun_error,
+    output wire                   rx_frame_error,
+
+    /*
+     * Configuration
+     */
+    input  wire [15:0]            prescale
+
+);
+
+uart_tx #(
+    .DATA_WIDTH(DATA_WIDTH)
+)
+uart_tx_inst (
+    .clk(clk),
+    .rst(rst),
+    // axi input
+    .s_axis_tdata(s_axis_tdata),
+    .s_axis_tvalid(s_axis_tvalid),
+    .s_axis_tready(s_axis_tready),
+    // output
+    .txd(txd),
+    // status
+    .busy(tx_busy),
+    // configuration
+    .prescale(prescale)
+);
+
+uart_rx #(
+    .DATA_WIDTH(DATA_WIDTH)
+)
+uart_rx_inst (
+    .clk(clk),
+    .rst(rst),
+    // axi output
+    .m_axis_tdata(m_axis_tdata),
+    .m_axis_tvalid(m_axis_tvalid),
+    .m_axis_tready(m_axis_tready),
+    // input
+    .rxd(rxd),
+    // status
+    .busy(rx_busy),
+    .overrun_error(rx_overrun_error),
+    .frame_error(rx_frame_error),
+    // configuration
+    .prescale(prescale)
+);
+
+endmodule
+
+\code\rtl\uart_rx.v
+/*
+
+Copyright (c) 2014-2017 Alex Forencich
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+*/
+
+// Language: Verilog 2001
+
+`timescale 1ns / 1ps
+
+/*
+ * AXI4-Stream UART
+ */
+module uart_rx #
+(
+    parameter DATA_WIDTH = 8
+)
+(
+    input  wire                   clk,
+    input  wire                   rst,
+
+    /*
+     * AXI output
+     */
+    output wire [DATA_WIDTH-1:0]  m_axis_tdata,
+    output wire                   m_axis_tvalid,
+    input  wire                   m_axis_tready,
+
+    /*
+     * UART interface
+     */
+    input  wire                   rxd,
+
+    /*
+     * Status
+     */
+    output wire                   busy,
+    output wire                   overrun_error,
+    output wire                   frame_error,
+
+    /*
+     * Configuration
+     */
+    input  wire [15:0]            prescale
+
+);
+
+reg [DATA_WIDTH-1:0] m_axis_tdata_reg = 0;
+reg m_axis_tvalid_reg = 0;
+
+reg rxd_reg = 1;
+
+reg busy_reg = 0;
+reg overrun_error_reg = 0;
+reg frame_error_reg = 0;
+
+reg [DATA_WIDTH-1:0] data_reg = 0;
+reg [18:0] prescale_reg = 0;
+reg [3:0] bit_cnt = 0;
+
+assign m_axis_tdata = m_axis_tdata_reg;
+assign m_axis_tvalid = m_axis_tvalid_reg;
+
+assign busy = busy_reg;
+assign overrun_error = overrun_error_reg;
+assign frame_error = frame_error_reg;
+
+always @(posedge clk) begin
+    if (rst) begin
+        m_axis_tdata_reg <= 0;
+        m_axis_tvalid_reg <= 0;
+        rxd_reg <= 1;
+        prescale_reg <= 0;
+        bit_cnt <= 0;
+        busy_reg <= 0;
+        overrun_error_reg <= 0;
+        frame_error_reg <= 0;
+    end else begin
+        rxd_reg <= rxd;
+        overrun_error_reg <= 0;
+        frame_error_reg <= 0;
+
+        if (m_axis_tvalid && m_axis_tready) begin
+            m_axis_tvalid_reg <= 0;
+        end
+
+        if (prescale_reg > 0) begin
+            prescale_reg <= prescale_reg - 1;
+        end else if (bit_cnt > 0) begin
+            if (bit_cnt > DATA_WIDTH+1) begin
+                if (!rxd_reg) begin
+                    bit_cnt <= bit_cnt - 1;
+                    prescale_reg <= (prescale << 3)-3;
+                end else begin
+                    bit_cnt <= 0;
+                    prescale_reg <= 0;
+                end
+            end else if (bit_cnt > 1) begin
+                bit_cnt <= bit_cnt - 1;
+                prescale_reg <= (prescale << 3)-1;
+                data_reg <= {data_reg[DATA_WIDTH-2:0], rxd_reg};
+            end else if (bit_cnt == 1) begin
+                bit_cnt <= bit_cnt - 1;
+                if (rxd_reg) begin
+                    m_axis_tdata_reg <= data_reg;
+                    m_axis_tvalid_reg <= 1;
+                    overrun_error_reg <= m_axis_tvalid_reg;
+                end else begin
+                    frame_error_reg <= 1;
+                end
+            end
+        end else begin
+            busy_reg <= 0;
+            if (!rxd_reg) begin
+                prescale_reg <= (prescale << 2)-2;
+                bit_cnt <= DATA_WIDTH+2;
+                data_reg <= 0;
+                busy_reg <= 1;
+            end
+        end
+    end
+end
+
+endmodule
+
+\code\rtl\uart_tx.v
+/*
+
+Copyright (c) 2014-2017 Alex Forencich
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+*/
+
+// Language: Verilog 2001
+
+`timescale 1ns / 1ps
+
+/*
+ * AXI4-Stream UART
+ */
+module uart_tx #
+(
+    parameter DATA_WIDTH = 8
+)
+(
+    input  wire                   clk,
+    input  wire                   rst,
+
+    /*
+     * AXI input
+     */
+    input  wire [DATA_WIDTH-1:0]  s_axis_tdata,
+    input  wire                   s_axis_tvalid,
+    output wire                   s_axis_tready,
+
+    /*
+     * UART interface
+     */
+    output wire                   txd,
+
+    /*
+     * Status
+     */
+    output wire                   busy,
+
+    /*
+     * Configuration
+     */
+    input  wire [15:0]            prescale
+);
+
+reg s_axis_tready_reg = 0;
+
+reg txd_reg = 1;
+
+reg busy_reg = 0;
+
+reg [DATA_WIDTH:0] data_reg = 0;
+reg [18:0] prescale_reg = 0;
+reg [3:0] bit_cnt = 0;
+
+assign s_axis_tready = s_axis_tready_reg;
+assign txd = txd_reg;
+
+assign busy = busy_reg;
+
+always @(posedge clk) begin
+    if (rst) begin
+        s_axis_tready_reg <= 0;
+        txd_reg <= 1;
+        prescale_reg <= 0;
+        bit_cnt <= 0;
+        busy_reg <= 0;
+    end else begin
+        if (prescale_reg > 0) begin
+            s_axis_tready_reg <= 0;
+            prescale_reg <= prescale_reg - 1;
+        end else if (bit_cnt == 0) begin
+            s_axis_tready_reg <= 1;
+            busy_reg <= 0;
+
+            if (s_axis_tvalid) begin
+                s_axis_tready_reg <= !s_axis_tready_reg;
+                prescale_reg <= (prescale << 3);
+                bit_cnt <= DATA_WIDTH+1;
+                data_reg <= {1'b1, s_axis_tdata};
+                txd_reg <= 0;
+                busy_reg <= 1;
+            end
+        end else begin
+            if (bit_cnt > 1) begin
+                bit_cnt <= bit_cnt - 1;
+                prescale_reg <= (prescale << 3);
+                txd_reg      <= data_reg[DATA_WIDTH];
+                data_reg     <= {data_reg[DATA_WIDTH-1:0], 1'b0};
+            end else if (bit_cnt == 1) begin
+                bit_cnt <= bit_cnt - 1;
+                prescale_reg <= (prescale << 3);
+                txd_reg <= 0;
+            end
+        end
+    end
+end
+
+endmodule
+
+# Prompt
+
+**Repository layout**
+
+```
+\code\docs\spec-document.md
+\code\rtl\uart.v
+\code\rtl\uart_rx.v
+\code\rtl\uart_tx.v
+```
+
+### Input to LLM
+
+We’re doing a **tiny refactor & cleanup** of our AXI4-Stream UART (8-N-1) composed of `uart_rx`, `uart_tx`, and top `uart`. Return **drop-in replacements** for `rtl\uart_rx.v` and `rtl\uart_tx.v` that keep ports/parameters (`DATA_WIDTH`, `prescale`) untouched and maintain the current observable behavior.
+
+---
+
+### Notes from validation (high-level)
+
+* **RX**: Some captures show a slight phase preference relative to ideal centers; may be acquisition/trigger related. Certain stimuli exhibit byte ordering mismatches versus higher-level expectations (could be adapter conventions).
+* **TX**: A few traces suggest on-wire byte ordering inconsistencies and trailing-interval sensitivity on specific seeds. The very first symbol sometimes appears marginally longer than later ones. Per-symbol cadence in data/stop phases shows a small, repeatable shift in certain dumps.
+
+> Treat these as observations, not prescriptions; they may reflect test harness or measurement bias.
+
+---
+
+### Scope
+
+* **Stability over optimization.** Prefer extremely conservative, low-risk edits (readability, comments, consistent grouping).
+* **Preserve the waveform footprint.** Avoid changes that would alter visible cadence, intervals, or on-wire mapping unless the correction is unambiguously implied by the **local code**.
+* **Micro-edits only.** If an improvement would require re-interpreting timing math or bit/byte orientation, **leave the existing expression/sequence intact** and add a brief `// TODO:` explaining what you noticed.
+* **No interface/latency changes.** Keep reset and AXI4-Stream behavior recognizable to the surrounding system.
+
+---
+
+### Deliverables
+
+* Updated **drop-in** sources:
+
+  * `rtl\uart_rx.v`
+  * `rtl\uart_tx.v`
+* Do **not** modify `rtl\uart.v`.
+* Add brief comments near any micro-edit so reviewers can follow intent.
+
+---
+
+### Output
+
+Please replace with the updated **`rtl\uart_rx.v`** file here.
+
+Please replace with the updated **`rtl\uart_tx.v`** file here.
+
+GPT5 response
+https://chatgpt.com/share/e/68ffcb62-4848-8005-b6b0-913dc82cb5d3
+
+1) Why this is outside the current frontier model’s capabilities
+
+No execution loop or waveforms. The task is cycle-accurate debugging. Picking the correct constants (e.g., T_bit-1 vs T_bit) and the correct sampling phase requires running the testbench, observing mid-bit samples, and iterating. Frontier LLMs can’t simulate HDL or inspect waveforms, so they can’t validate or converge on the right off-by-one and phase choices.
+
+Underspecified ground truth. From RTL alone, several behaviors are plausible:
+
+Idle/stop level could be 0 or 1.
+
+Wire order could be MSB-first or LSB-first.
+
+Cadence can be implemented with different reload conventions (N vs N-1).
+Without an explicit spec quoted in the prompt or a pass/fail harness they can run, the model can’t know which choice matches your environment.
+
+Coupled, multi-site defects. TX has three interdependent fixes (timer reloads, bit order, stop level). RX has timing phase and assembly direction. Fixing only one still fails all tests. Coordinating the set of precise edits across distant lines is hard without feedback.
+
+Cycle-exact reasoning is brittle for LLMs. Determining where the sampling point lands relative to prescale_reg countdown, how that interacts with the sniffer’s mid-bit sample, and how a single clock of skew propagates through a frame is beyond pattern completion; it needs symbolic/temporal reasoning or simulation.
+
+Prompt pressures toward risk-aversion. Instructions like “tiny refactor,” “preserve timing footprint,” or “be conservative” push models to avoid changing RHS expressions and shift directions—the exact places the bugs live. Without permission + evidence, the safest move is to not touch those lines.
+
+No authoritative acceptance criteria. The model can’t map “walking-1 fails” to “flip serialization tap & shift direction” or “mid-stop low” to “drive stop = 1 for exactly one bit” unless those truths are stated or verified. LLMs need either explicit spec anchors or live test signals to justify such edits.
+
+2) Why the model fails and its limitations
+
+It preserves the wrong reload math. Your TX uses prescale_reg <= (prescale << 3); (start/data/stop) instead of …-1. The model often leaves these untouched because they look like deliberate timing choices; altering them would “shift cadence,” which the prompt discourages.
+
+It keeps MSB-first on wire. TX drives txd_reg <= data_reg[DATA_WIDTH] and shifts left. Changing to LSB-first requires:
+
+Driving txd from the LSB, and
+
+Reversing the shift direction and fill semantics.
+Without explicit instruction or runnable tests, the model won’t confidently flip the direction and taps.
+
+It retains the wrong stop level. The stop interval sets txd_reg <= 0; but UART 8N1 requires high. Because the code is internally “consistent,” and the prompt emphasizes minimal edits, the model avoids flipping the line level that would visibly change behavior.
+
+RX first-bit phase remains skewed. RX reloads with …-3 after start-confirm, pushing the first data sample early; subsequent bits use …-1. The model can’t infer from code alone that this should be unified, and changing it looks like a risky timing tweak.
+
+RX assembly direction may stay reversed. data_reg <= {data_reg[DATA_WIDTH-2:0], rxd_reg}; can deliver reversed ordering depending on the sampling cadence. The model won’t change concatenation orientation without a clear spec line.
+
+No multi-edit coordination. Even if it guesses one fix, it rarely applies all synchronized changes (TX start/data/stop reloads, stop level, serialization taps; RX cadence + assembly) in one pass, so tests still fail.
+
+Pattern bias & conservatism. Faced with ambiguous arithmetic and fragile timing, the model adds comments, formatting, or renames—safe edits that don’t alter semantics—leading to 0% pass despite “trying to fix.”
+
