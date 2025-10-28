@@ -1,0 +1,737 @@
+#Context
+
+\code\docs\spec-document.md
+# AXI4-Stream UART (TX/RX/Top) — Specification Document
+
+## Introduction
+
+This document specifies a minimal **AXI4-Stream UART** consisting of three RTL blocks:
+
+* **`uart_tx`** — AXI-Stream to UART transmitter
+* **`uart_rx`** — UART to AXI-Stream receiver
+* **`uart`** — Top-level wrapper that instantiates `uart_tx` and `uart_rx`
+
+The design implements **8N1 framing** (1 start bit, 8 data bits, 1 stop bit, no parity) with a programmable baud rate via a **prescaler**. The AXI4-Stream side is **one byte per beat** (no `tkeep`/`tlast`) with standard `tvalid/tready` back-pressure. The UART line idles **high**.
+
+---
+
+## UART Framing & Timing
+
+### Line Format
+
+* **Idle:** `1`
+* **Start bit:** `0` for one bit time
+* **Data bits:** `DATA_WIDTH` bits, **LSB first**
+* **Stop bit:** `1` for one bit time
+
+### Bit Timing (Prescaler)
+
+* **Bit period (in clk cycles):**
+  `T_bit = prescale << 3 = prescale * 8`
+* **Suggested baud calculation:**
+  `prescale = f_clk / (baud * 8)` (rounded to nearest integer)
+
+### Receive Sampling (8× oversample)
+
+* Detect start edge (`rxd == 0`), then wait roughly **½ bit** to re-sample center of the start bit:
+  `prescale_reg <= (prescale << 2) - 2` (≈ `4*prescale - 2`)
+* Subsequent samples occur every bit period:
+  `prescale_reg <= (prescale << 3) - 1` (≈ `8*prescale - 1`)
+
+---
+
+## Module: `uart_tx` — AXI-Stream to UART Transmitter
+
+### Interface: uart_tx
+
+```verilog
+module uart_tx #(
+  parameter DATA_WIDTH = 8
+)(
+  input  wire                  clk,
+  input  wire                  rst,
+  // AXI4-Stream input (1 byte/beat)
+  input  wire [DATA_WIDTH-1:0] s_axis_tdata,
+  input  wire                  s_axis_tvalid,
+  output wire                  s_axis_tready,
+  // UART line
+  output wire                  txd,
+  // Status
+  output wire                  busy,
+  // Configuration
+  input  wire [15:0]           prescale
+);
+```
+
+### Port Description: uart_tx
+
+| Port            | Dir | Description                                                      |
+| --------------- | --- | ---------------------------------------------------------------- |
+| `clk`           | in  | System clock.                                                    |
+| `rst`           | in  | Synchronous active-high reset.                                   |
+| `s_axis_tdata`  | in  | Byte to transmit (LSB sent first).                               |
+| `s_axis_tvalid` | in  | Valid qualifier for `s_axis_tdata`.                              |
+| `s_axis_tready` | out | TX ready to accept a byte **only when idle** (one-cycle accept). |
+| `txd`           | out | UART transmit line (idles high).                                 |
+| `busy`          | out | High while a frame is being transmitted.                         |
+| `prescale`      | in  | Bit time control (see **Bit Timing**).                           |
+
+### Behavior
+
+1. **Ready/Handshake**
+
+   * `s_axis_tready = 1` only when **idle** (`bit_cnt == 0` and timer idle).
+   * On `s_axis_tvalid && s_axis_tready`, TX latches the byte and immediately starts the start bit.
+   * `s_axis_tready` is then deasserted until the entire frame completes.
+
+2. **Framing**
+
+   * **Start bit:** drive `txd = 0` for `T_bit` cycles.
+   * **Data bits:** shift out **LSB first**; one bit per `T_bit`.
+   * **Stop bit:** drive `txd = 1` for `T_bit` cycles.
+   * `busy` is asserted during the whole frame.
+
+3. **Counters**
+
+   * `prescale_reg` (≈19b): down-counter for intra-bit timing.
+   * `bit_cnt` (4b): counts remaining bits in the frame (`DATA_WIDTH + 1` for data+stop).
+
+### Latency & Throughput
+
+| Event                             | Latency                           |
+| --------------------------------- | --------------------------------- |
+| Accept byte after idle `tready=1` | 1 cycle handshake                 |
+| Start bit drive after accept      | Same cycle/next (registered)      |
+| Byte transmit time                | `(DATA_WIDTH + 2) * T_bit` cycles |
+
+* **Throughput:** One byte per `(DATA_WIDTH+2)` bit times (no streaming overlap; single-entry buffer).
+
+---
+
+## Module: `uart_rx` — UART to AXI-Stream Receiver
+
+### Interface: uart_rx
+
+```verilog
+module uart_rx #(
+  parameter DATA_WIDTH = 8
+)(
+  input  wire                  clk,
+  input  wire                  rst,
+  // AXI4-Stream output (1 byte/beat)
+  output wire [DATA_WIDTH-1:0] m_axis_tdata,
+  output wire                  m_axis_tvalid,
+  input  wire                  m_axis_tready,
+  // UART line
+  input  wire                  rxd,
+  // Status
+  output wire                  busy,
+  output wire                  overrun_error,
+  output wire                  frame_error,
+  // Configuration
+  input  wire [15:0]           prescale
+);
+```
+
+### Port Description
+
+| Port            | Dir | Description                                                                                                        |
+| --------------- | --- | ------------------------------------------------------------------------------------------------------------------ |
+| `clk`           | in  | System clock.                                                                                                      |
+| `rst`           | in  | Synchronous active-high reset.                                                                                     |
+| `m_axis_tdata`  | out | Received byte (stable while `m_axis_tvalid=1`).                                                                    |
+| `m_axis_tvalid` | out | Asserted when a byte is ready; **held** until `m_axis_tready`.                                                     |
+| `m_axis_tready` | in  | Downstream ready for one-beat transfer.                                                                            |
+| `rxd`           | in  | UART receive line (idles high).                                                                                    |
+| `busy`          | out | High while the receiver is actively sampling a frame.                                                              |
+| `overrun_error` | out | **One-cycle pulse** if a new byte completes while the previous has not been accepted (`m_axis_tvalid` still high). |
+| `frame_error`   | out | **One-cycle pulse** on stop-bit error (expected `1`, sampled `0`).                                                 |
+| `prescale`      | in  | Bit time control (see **Bit Timing**).                                                                             |
+
+### Receive Procedure
+
+1. **Idle & Start Detection**
+
+   * While idle (`busy=0`), watch for `rxd=0`.
+   * On low, preload `prescale_reg <= (prescale<<2)-2` (~½ bit) and set `bit_cnt <= DATA_WIDTH + 2` (start confirm + data + stop), `busy<=1`.
+
+2. **Start Confirmation**
+
+   * After the ½-bit delay, if line is still low, proceed; otherwise abort (spurious glitch).
+
+3. **Data Bit Sampling**
+
+   * Every `T_bit` cycles, sample the line near bit center.
+   * **LSB-first reconstruction:**
+     `data_reg <= {rxd_sample, data_reg[DATA_WIDTH-1:1]}`
+     After `DATA_WIDTH` samples, `data_reg` holds the byte in correct order.
+
+4. **Stop Bit Check & AXIS Output**
+
+   * On stop sample: if `rxd==1`, assert `m_axis_tvalid` and drive `m_axis_tdata <= data_reg`.
+   * If `m_axis_tvalid` was already high (previous byte unconsumed), assert **`overrun_error`** for one cycle.
+   * If `rxd==0` at stop, assert **`frame_error`** for one cycle and drop the byte.
+
+5. **AXIS Handshake**
+
+   * `m_axis_tvalid` remains **asserted** until `m_axis_tready` is seen; then it clears.
+
+### Latency & Back-pressure
+
+| Event                           | Behavior                                                                              |
+| ------------------------------- | ------------------------------------------------------------------------------------- |
+| First sample after start detect | ~½ bit after falling edge                                                             |
+| Byte availability (`tvalid=1`)  | Immediately after stop check                                                          |
+| Back-pressure                   | Byte is **held** until accepted; next completed byte during hold triggers **overrun** |
+
+---
+
+## Top-Level: `uart`
+
+### Interface
+
+```verilog
+module uart #(
+  parameter DATA_WIDTH = 8
+)(
+  input  wire                  clk,
+  input  wire                  rst,
+  // AXI4-Stream in (TX)
+  input  wire [DATA_WIDTH-1:0] s_axis_tdata,
+  input  wire                  s_axis_tvalid,
+  output wire                  s_axis_tready,
+  // AXI4-Stream out (RX)
+  output wire [DATA_WIDTH-1:0] m_axis_tdata,
+  output wire                  m_axis_tvalid,
+  input  wire                  m_axis_tready,
+  // UART pins
+  input  wire                  rxd,
+  output wire                  txd,
+  // Status
+  output wire                  tx_busy,
+  output wire                  rx_busy,
+  output wire                  rx_overrun_error,
+  output wire                  rx_frame_error,
+  // Configuration
+  input  wire [15:0]           prescale
+);
+```
+
+* Instantiates `uart_tx` and `uart_rx` and wires `prescale` to both.
+* Provides consolidated status (`tx_busy`, `rx_busy`, `rx_overrun_error`, `rx_frame_error`).
+
+---
+
+## Internal Architecture
+
+### `uart_tx`
+
+* **Registers**
+
+  * `data_reg [DATA_WIDTH:0]`: shift register (includes stop bit pre-load).
+  * `prescale_reg [18:0]`: per-bit down-counter.
+  * `bit_cnt [3:0]`: counts remaining data/stop bits.
+  * `txd_reg`, `busy_reg`, `s_axis_tready_reg`.
+* **Operation**
+
+  * Idle → accept beat → start bit → data bits (LSB first) → stop bit → idle.
+
+### `uart_rx`
+
+* **Registers**
+
+  * `data_reg [DATA_WIDTH-1:0]`: reconstructed byte.
+  * `prescale_reg [18:0]`: sampling timer.
+  * `bit_cnt [3:0]`: counts start/data/stop phases.
+  * `m_axis_tdata_reg`, `m_axis_tvalid_reg`, `busy_reg`.
+  * `overrun_error_reg`, `frame_error_reg`.
+  * `rxd_reg`: 1-FF input synchronizer (single stage).
+* **Operation**
+
+  * Idle detect → mid-start confirm → data sampling at bit centers → stop check → AXIS present/hold.
+
+---
+
+## Reset Behavior
+
+* **Synchronous** active-high reset (`rst`).
+* Clears all internal registers, counters, status, and `tvalid/tready` to idle defaults:
+
+  * TX: `txd=1`, `busy=0`, `s_axis_tready=0` (re-asserted when idle after reset releases).
+  * RX: `m_axis_tvalid=0`, `busy=0`, errors cleared.
+
+---
+
+## Assumptions & Limits
+
+* **Clocking:** Single synchronous clock domain for AXI and UART sampling logic.
+* **Prescale range:** 16-bit input; effective bit timer uses 19 bits.
+* **Data width:** Parameter `DATA_WIDTH` (default 8); `bit_cnt` sized for up to 10 bits (8 data + start/stop bookkeeping).
+* **Metastability:** RX uses a single-FF input stage; for robust async inputs, a **2-FF synchronizer** is recommended at top-level integration.
+* **No parity / multi-stop support** in this version (8N1 only).
+* **Buffering:** TX single-entry (accepts when idle). RX has **no FIFO**; overrun flagged if output byte is not consumed before next completes.
+
+---
+
+## Timing Summary
+
+| Item                    | Value/Rule                                                     |
+| ----------------------- | -------------------------------------------------------------- |
+| Bit time                | `T_bit = prescale * 8` clock cycles                            |
+| TX accept window        | Only when idle (`tready=1`)                                    |
+| TX frame duration       | `(DATA_WIDTH + 2) * T_bit` cycles                              |
+| RX start re-sample      | `(prescale<<2) - 2` cycles after start edge                    |
+| RX inter-bit spacing    | `(prescale<<3) - 1` cycles                                     |
+| RX `m_axis_tvalid` hold | Until `m_axis_tready`                                          |
+| Overrun indication      | 1-cycle pulse on new-byte completion while previous `tvalid=1` |
+| Frame error             | 1-cycle pulse on stop bit `0`                                  |
+
+---
+
+## Integration & Configuration Notes
+
+* **Baud programming:** Compute `prescale = f_clk / (baud * 8)`; verify tolerance with your clock and desired baud.
+* **Back-pressure:** Ensure downstream consumer asserts `m_axis_tready` frequently enough to avoid `overrun_error`.
+* **Clock domain crossing:** If `rxd` originates from another clock domain or an external pad, insert a **2-FF synchronizer** before `uart_rx`.
+* **Synthesis:** Modules are Verilog-2001; no vendor primitives required.
+
+---
+
+\code\rtl\uart.v
+/*
+
+Copyright (c) 2014-2017 Alex Forencich
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+*/
+
+// Language: Verilog 2001
+
+`timescale 1ns / 1ps
+
+/*
+ * AXI4-Stream UART
+ */
+module uart #
+(
+    parameter DATA_WIDTH = 8
+)
+(
+    input  wire                   clk,
+    input  wire                   rst,
+
+    /*
+     * AXI input
+     */
+    input  wire [DATA_WIDTH-1:0]  s_axis_tdata,
+    input  wire                   s_axis_tvalid,
+    output wire                   s_axis_tready,
+
+    /*
+     * AXI output
+     */
+    output wire [DATA_WIDTH-1:0]  m_axis_tdata,
+    output wire                   m_axis_tvalid,
+    input  wire                   m_axis_tready,
+
+    /*
+     * UART interface
+     */
+    input  wire                   rxd,
+    output wire                   txd,
+
+    /*
+     * Status
+     */
+    output wire                   tx_busy,
+    output wire                   rx_busy,
+    output wire                   rx_overrun_error,
+    output wire                   rx_frame_error,
+
+    /*
+     * Configuration
+     */
+    input  wire [15:0]            prescale
+
+);
+
+uart_tx #(
+    .DATA_WIDTH(DATA_WIDTH)
+)
+uart_tx_inst (
+    .clk(clk),
+    .rst(rst),
+    // axi input
+    .s_axis_tdata(s_axis_tdata),
+    .s_axis_tvalid(s_axis_tvalid),
+    .s_axis_tready(s_axis_tready),
+    // output
+    .txd(txd),
+    // status
+    .busy(tx_busy),
+    // configuration
+    .prescale(prescale)
+);
+
+uart_rx #(
+    .DATA_WIDTH(DATA_WIDTH)
+)
+uart_rx_inst (
+    .clk(clk),
+    .rst(rst),
+    // axi output
+    .m_axis_tdata(m_axis_tdata),
+    .m_axis_tvalid(m_axis_tvalid),
+    .m_axis_tready(m_axis_tready),
+    // input
+    .rxd(rxd),
+    // status
+    .busy(rx_busy),
+    .overrun_error(rx_overrun_error),
+    .frame_error(rx_frame_error),
+    // configuration
+    .prescale(prescale)
+);
+
+endmodule
+
+\code\rtl\uart_rx.v
+/*
+
+Copyright (c) 2014-2017 Alex Forencich
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+*/
+
+// Language: Verilog 2001
+
+`timescale 1ns / 1ps
+
+/*
+ * AXI4-Stream UART
+ */
+module uart_rx #
+(
+    parameter DATA_WIDTH = 8
+)
+(
+    input  wire                   clk,
+    input  wire                   rst,
+
+    /*
+     * AXI output
+     */
+    output wire [DATA_WIDTH-1:0]  m_axis_tdata,
+    output wire                   m_axis_tvalid,
+    input  wire                   m_axis_tready,
+
+    /*
+     * UART interface
+     */
+    input  wire                   rxd,
+
+    /*
+     * Status
+     */
+    output wire                   busy,
+    output wire                   overrun_error,
+    output wire                   frame_error,
+
+    /*
+     * Configuration
+     */
+    input  wire [15:0]            prescale
+
+);
+
+reg [DATA_WIDTH-1:0] m_axis_tdata_reg = 0;
+reg m_axis_tvalid_reg = 0;
+
+reg rxd_reg = 1;
+
+reg busy_reg = 0;
+reg overrun_error_reg = 0;
+reg frame_error_reg = 0;
+
+reg [DATA_WIDTH-1:0] data_reg = 0;
+reg [18:0] prescale_reg = 0;
+reg [3:0] bit_cnt = 0;
+
+assign m_axis_tdata = m_axis_tdata_reg;
+assign m_axis_tvalid = m_axis_tvalid_reg;
+
+assign busy = busy_reg;
+assign overrun_error = overrun_error_reg;
+assign frame_error = frame_error_reg;
+
+always @(posedge clk) begin
+    if (rst) begin
+        m_axis_tdata_reg <= 0;
+        m_axis_tvalid_reg <= 0;
+        rxd_reg <= 1;
+        prescale_reg <= 0;
+        bit_cnt <= 0;
+        busy_reg <= 0;
+        overrun_error_reg <= 0;
+        frame_error_reg <= 0;
+    end else begin
+        rxd_reg <= rxd;
+        overrun_error_reg <= 0;
+        frame_error_reg <= 0;
+
+        if (m_axis_tvalid && m_axis_tready) begin
+            m_axis_tvalid_reg <= 0;
+        end
+
+        if (prescale_reg > 0) begin
+            prescale_reg <= prescale_reg - 1;
+        end else if (bit_cnt > 0) begin
+            if (bit_cnt > DATA_WIDTH+1) begin
+                if (!rxd_reg) begin
+                    bit_cnt <= bit_cnt - 1;
+                    prescale_reg <= (prescale << 3)-3;
+                end else begin
+                    bit_cnt <= 0;
+                    prescale_reg <= 0;
+                end
+            end else if (bit_cnt > 1) begin
+                bit_cnt <= bit_cnt - 1;
+                prescale_reg <= (prescale << 3)-1;
+                data_reg <= {data_reg[DATA_WIDTH-2:0], rxd_reg};
+            end else if (bit_cnt == 1) begin
+                bit_cnt <= bit_cnt - 1;
+                if (rxd_reg) begin
+                    m_axis_tdata_reg <= data_reg;
+                    m_axis_tvalid_reg <= 1;
+                    overrun_error_reg <= m_axis_tvalid_reg;
+                end else begin
+                    frame_error_reg <= 1;
+                end
+            end
+        end else begin
+            busy_reg <= 0;
+            if (!rxd_reg) begin
+                prescale_reg <= (prescale << 2)-2;
+                bit_cnt <= DATA_WIDTH+2;
+                data_reg <= 0;
+                busy_reg <= 1;
+            end
+        end
+    end
+end
+
+endmodule
+
+\code\rtl\uart_tx.v
+/*
+
+Copyright (c) 2014-2017 Alex Forencich
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+*/
+
+// Language: Verilog 2001
+
+`timescale 1ns / 1ps
+
+/*
+ * AXI4-Stream UART
+ */
+module uart_tx #
+(
+    parameter DATA_WIDTH = 8
+)
+(
+    input  wire                   clk,
+    input  wire                   rst,
+
+    /*
+     * AXI input
+     */
+    input  wire [DATA_WIDTH-1:0]  s_axis_tdata,
+    input  wire                   s_axis_tvalid,
+    output wire                   s_axis_tready,
+
+    /*
+     * UART interface
+     */
+    output wire                   txd,
+
+    /*
+     * Status
+     */
+    output wire                   busy,
+
+    /*
+     * Configuration
+     */
+    input  wire [15:0]            prescale
+);
+
+reg s_axis_tready_reg = 0;
+
+reg txd_reg = 1;
+
+reg busy_reg = 0;
+
+reg [DATA_WIDTH:0] data_reg = 0;
+reg [18:0] prescale_reg = 0;
+reg [3:0] bit_cnt = 0;
+
+assign s_axis_tready = s_axis_tready_reg;
+assign txd = txd_reg;
+
+assign busy = busy_reg;
+
+always @(posedge clk) begin
+    if (rst) begin
+        s_axis_tready_reg <= 0;
+        txd_reg <= 1;
+        prescale_reg <= 0;
+        bit_cnt <= 0;
+        busy_reg <= 0;
+    end else begin
+        if (prescale_reg > 0) begin
+            s_axis_tready_reg <= 0;
+            prescale_reg <= prescale_reg - 1;
+        end else if (bit_cnt == 0) begin
+            s_axis_tready_reg <= 1;
+            busy_reg <= 0;
+
+            if (s_axis_tvalid) begin
+                s_axis_tready_reg <= !s_axis_tready_reg;
+                prescale_reg <= (prescale << 3);
+                bit_cnt <= DATA_WIDTH+1;
+                data_reg <= {1'b1, s_axis_tdata};
+                txd_reg <= 0;
+                busy_reg <= 1;
+            end
+        end else begin
+            if (bit_cnt > 1) begin
+                bit_cnt <= bit_cnt - 1;
+                prescale_reg <= (prescale << 3);
+                txd_reg      <= data_reg[DATA_WIDTH];
+                data_reg     <= {data_reg[DATA_WIDTH-1:0], 1'b0};
+            end else if (bit_cnt == 1) begin
+                bit_cnt <= bit_cnt - 1;
+                prescale_reg <= (prescale << 3);
+                txd_reg <= 0;
+            end
+        end
+    end
+end
+
+endmodule
+
+# Prompt
+
+**Repository layout**
+
+```
+\code\docs\spec-document.md
+\code\rtl\uart.v
+\code\rtl\uart_rx.v
+\code\rtl\uart_tx.v
+```
+
+### Task
+
+We ship a parametric AXI4-Stream **UART (8-N-1)** composed of `uart_rx`, `uart_tx`, and top `uart`. Provide **drop-in replacements** for `rtl\uart_rx.v` and `rtl\uart_tx.v` that improve correctness/robustness while keeping ports and parameters (`DATA_WIDTH`, `prescale`) intact. Use `docs/spec-document.md` as the behavioral reference (idle high, start=0, **LSB-first** data, stop=1; AXI handshakes as documented).
+
+### Known issues 
+
+* **Receiver (`uart_rx`)**
+
+  * **Inter-bit sampling cadence:** After the mid-start confirmation, the first data sample and subsequent samples are **slightly early** relative to true bit centers; sensitivity increases at lower `prescale`.
+  * **Byte reconstruction orientation:** The assembled byte does **not** match the UART **LSB-first** wire convention.
+
+* **Transmitter (`uart_tx`)**
+
+  * **Serialization order:** On-wire data bit sequence does **not** follow **LSB-first**.
+  * **Stop interval level/duration:** The stop interval is **not held at idle-high** for a full bit time.
+  * **Bit-time consistency:** At the start of a frame and during data bits, one or more bit intervals **do not match the configured bit time**, causing uneven pacing.
+
+> Bring the implementation toward spec with **small, local edits** only.
+
+### Hard constraints (preserve exactly)
+
+* **Interfaces & latency:** No new ports/params; no added pipelines/FIFOs; keep reset behavior and externally visible timing/handshakes.
+* **AXI4-Stream semantics unchanged**
+
+  * TX: `s_axis_tready` asserted only when idle; deasserts on accept; `busy` asserted while a frame is in progress.
+  * RX: `m_axis_tvalid` holds until `m_axis_tready`; `overrun_error` and `frame_error` remain **single-cycle pulses**.
+* **Freeze TX bit-timer arithmetic and placement**
+
+  * In `uart_tx`, **do not modify any right-hand-side expressions assigned to `prescale_reg`** and **do not relocate those assignments** (keep the exact numeric forms and their control-flow locations in the start/data/stop paths).
+  * Do not add alternate timer phases or additional counters in TX.
+* **RX start timing anchor stays**
+
+  * Keep the **start-edge ~half-bit wait** statement and its control-flow placement as is.
+
+### Deliverables
+
+* Provide **drop-in replacements** for:
+
+  * `rtl\uart_rx.v`
+  * `rtl\uart_tx.v`
+* Keep edits minimal; add short comments near changes (e.g., “RX: center-cadence for data/stop”, “RX: LSB-first assembly”, “TX: LSB-first serialization”, “TX: stop at idle level”).
+* **Do not** modify `rtl\uart.v`.
+
+### Output
+
+Please replace with the updated **`rtl\uart_rx.v`** file here.
+Please replace with the updated **`rtl\uart_tx.v`** file here.
+
+GPT5 response
+https://chatgpt.com/share/e/68ff8af4-0d5c-8005-9040-0a5e89781bae

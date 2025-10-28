@@ -1,0 +1,541 @@
+#Context
+\code\rtl\uart.v
+/*
+
+Copyright (c) 2014-2017 Alex Forencich
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+*/
+
+// Language: Verilog 2001
+
+`timescale 1ns / 1ps
+
+/*
+ * AXI4-Stream UART
+ */
+module uart #
+(
+    parameter DATA_WIDTH = 8
+)
+(
+    input  wire                   clk,
+    input  wire                   rst,
+
+    /*
+     * AXI input
+     */
+    input  wire [DATA_WIDTH-1:0]  s_axis_tdata,
+    input  wire                   s_axis_tvalid,
+    output wire                   s_axis_tready,
+
+    /*
+     * AXI output
+     */
+    output wire [DATA_WIDTH-1:0]  m_axis_tdata,
+    output wire                   m_axis_tvalid,
+    input  wire                   m_axis_tready,
+
+    /*
+     * UART interface
+     */
+    input  wire                   rxd,
+    output wire                   txd,
+
+    /*
+     * Status
+     */
+    output wire                   tx_busy,
+    output wire                   rx_busy,
+    output wire                   rx_overrun_error,
+    output wire                   rx_frame_error,
+
+    /*
+     * Configuration
+     */
+    input  wire [15:0]            prescale
+
+);
+
+uart_tx #(
+    .DATA_WIDTH(DATA_WIDTH)
+)
+uart_tx_inst (
+    .clk(clk),
+    .rst(rst),
+    // axi input
+    .s_axis_tdata(s_axis_tdata),
+    .s_axis_tvalid(s_axis_tvalid),
+    .s_axis_tready(s_axis_tready),
+    // output
+    .txd(txd),
+    // status
+    .busy(tx_busy),
+    // configuration
+    .prescale(prescale)
+);
+
+uart_rx #(
+    .DATA_WIDTH(DATA_WIDTH)
+)
+uart_rx_inst (
+    .clk(clk),
+    .rst(rst),
+    // axi output
+    .m_axis_tdata(m_axis_tdata),
+    .m_axis_tvalid(m_axis_tvalid),
+    .m_axis_tready(m_axis_tready),
+    // input
+    .rxd(rxd),
+    // status
+    .busy(rx_busy),
+    .overrun_error(rx_overrun_error),
+    .frame_error(rx_frame_error),
+    // configuration
+    .prescale(prescale)
+);
+
+endmodule
+
+\code\rtl\uart_rx.v
+/*
+
+Copyright (c) 2014-2017 Alex Forencich
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+*/
+
+// Language: Verilog 2001
+
+`timescale 1ns / 1ps
+
+/*
+ * AXI4-Stream UART
+ */
+module uart_rx #
+(
+    parameter DATA_WIDTH = 8
+)
+(
+    input  wire                   clk,
+    input  wire                   rst,
+
+    /*
+     * AXI output
+     */
+    output wire [DATA_WIDTH-1:0]  m_axis_tdata,
+    output wire                   m_axis_tvalid,
+    input  wire                   m_axis_tready,
+
+    /*
+     * UART interface
+     */
+    input  wire                   rxd,
+
+    /*
+     * Status
+     */
+    output wire                   busy,
+    output wire                   overrun_error,
+    output wire                   frame_error,
+
+    /*
+     * Configuration
+     */
+    input  wire [15:0]            prescale
+
+);
+
+reg [DATA_WIDTH-1:0] m_axis_tdata_reg = 0;
+reg m_axis_tvalid_reg = 0;
+
+reg rxd_reg = 1;
+
+reg busy_reg = 0;
+reg overrun_error_reg = 0;
+reg frame_error_reg = 0;
+
+reg [DATA_WIDTH-1:0] data_reg = 0;
+reg [18:0] prescale_reg = 0;
+reg [3:0] bit_cnt = 0;
+
+assign m_axis_tdata = m_axis_tdata_reg;
+assign m_axis_tvalid = m_axis_tvalid_reg;
+
+assign busy = busy_reg;
+assign overrun_error = overrun_error_reg;
+assign frame_error = frame_error_reg;
+
+always @(posedge clk) begin
+    if (rst) begin
+        m_axis_tdata_reg <= 0;
+        m_axis_tvalid_reg <= 0;
+        rxd_reg <= 1;
+        prescale_reg <= 0;
+        bit_cnt <= 0;
+        busy_reg <= 0;
+        overrun_error_reg <= 0;
+        frame_error_reg <= 0;
+    end else begin
+        rxd_reg <= rxd;
+        overrun_error_reg <= 0;
+        frame_error_reg <= 0;
+
+        if (m_axis_tvalid && m_axis_tready) begin
+            m_axis_tvalid_reg <= 0;
+        end
+
+        if (prescale_reg > 0) begin
+            prescale_reg <= prescale_reg - 1;
+        end else if (bit_cnt > 0) begin
+            if (bit_cnt > DATA_WIDTH+1) begin
+                if (!rxd_reg) begin
+                    bit_cnt <= bit_cnt - 1;
+                    prescale_reg <= (prescale << 3)-3;
+                end else begin
+                    bit_cnt <= 0;
+                    prescale_reg <= 0;
+                end
+            end else if (bit_cnt > 1) begin
+                bit_cnt <= bit_cnt - 1;
+                prescale_reg <= (prescale << 3)-1;
+                data_reg <= {data_reg[DATA_WIDTH-2:0], rxd_reg};
+            end else if (bit_cnt == 1) begin
+                bit_cnt <= bit_cnt - 1;
+                if (rxd_reg) begin
+                    m_axis_tdata_reg <= data_reg;
+                    m_axis_tvalid_reg <= 1;
+                    overrun_error_reg <= m_axis_tvalid_reg;
+                end else begin
+                    frame_error_reg <= 1;
+                end
+            end
+        end else begin
+            busy_reg <= 0;
+            if (!rxd_reg) begin
+                prescale_reg <= (prescale << 2)-2;
+                bit_cnt <= DATA_WIDTH+2;
+                data_reg <= 0;
+                busy_reg <= 1;
+            end
+        end
+    end
+end
+
+endmodule
+
+\code\rtl\uart_tx.v
+/*
+
+Copyright (c) 2014-2017 Alex Forencich
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+*/
+
+// Language: Verilog 2001
+
+`timescale 1ns / 1ps
+
+/*
+ * AXI4-Stream UART
+ */
+module uart_tx #
+(
+    parameter DATA_WIDTH = 8
+)
+(
+    input  wire                   clk,
+    input  wire                   rst,
+
+    /*
+     * AXI input
+     */
+    input  wire [DATA_WIDTH-1:0]  s_axis_tdata,
+    input  wire                   s_axis_tvalid,
+    output wire                   s_axis_tready,
+
+    /*
+     * UART interface
+     */
+    output wire                   txd,
+
+    /*
+     * Status
+     */
+    output wire                   busy,
+
+    /*
+     * Configuration
+     */
+    input  wire [15:0]            prescale
+);
+
+reg s_axis_tready_reg = 0;
+
+reg txd_reg = 1;
+
+reg busy_reg = 0;
+
+reg [DATA_WIDTH:0] data_reg = 0;
+reg [18:0] prescale_reg = 0;
+reg [3:0] bit_cnt = 0;
+
+assign s_axis_tready = s_axis_tready_reg;
+assign txd = txd_reg;
+
+assign busy = busy_reg;
+
+always @(posedge clk) begin
+    if (rst) begin
+        s_axis_tready_reg <= 0;
+        txd_reg <= 1;
+        prescale_reg <= 0;
+        bit_cnt <= 0;
+        busy_reg <= 0;
+    end else begin
+        if (prescale_reg > 0) begin
+            s_axis_tready_reg <= 0;
+            prescale_reg <= prescale_reg - 1;
+        end else if (bit_cnt == 0) begin
+            s_axis_tready_reg <= 1;
+            busy_reg <= 0;
+
+            if (s_axis_tvalid) begin
+                s_axis_tready_reg <= !s_axis_tready_reg;
+                prescale_reg <= (prescale << 3);
+                bit_cnt <= DATA_WIDTH+1;
+                data_reg <= {1'b1, s_axis_tdata};
+                txd_reg <= 0;
+                busy_reg <= 1;
+            end
+        end else begin
+            if (bit_cnt > 1) begin
+                bit_cnt <= bit_cnt - 1;
+                prescale_reg <= (prescale << 3);
+                txd_reg      <= data_reg[DATA_WIDTH];
+                data_reg     <= {data_reg[DATA_WIDTH-1:0], 1'b0};
+            end else if (bit_cnt == 1) begin
+                bit_cnt <= bit_cnt - 1;
+                prescale_reg <= (prescale << 3);
+                txd_reg <= 0;
+            end
+        end
+    end
+end
+
+endmodule
+
+
+#Prompt
+
+**Repository layout**
+
+```
+\code\rtl\uart.v
+\code\rtl\uart_rx.v
+\code\rtl\uart_tx.v
+```
+
+---
+
+## Input to LLM:
+
+We have a parametric AXI4-Stream UART (8-N-1) composed of `uart_rx`, `uart_tx`, and a top wrapper `uart`.
+Your task is to **diagnose and fix bugs** in the RX and TX RTL so that the implementation matches the behavior described below and in `docs/spec-document.md`. Do **not** change top-level ports or the module parameterization (`DATA_WIDTH`, `prescale`). Keep ready/valid semantics and overall structure intact. Return **drop-in replacements** for `rtl\uart_rx.v` and `rtl\uart_tx.v`, with brief comments near each change explaining intent (e.g., “align first data sampling to mid-bit,” “ensure LSB-first assembly,” “drive stop at idle level for one bit”).
+
+---
+
+## Bug description
+
+### UART Receive RTL (`uart_rx`) Bug Fixes
+
+Identify and correct logical bugs in the **UART Receive RTL (`uart_rx`)** related to **inter-bit sampling timing** and **bit reconstruction order**. These issues distort on-wire data recovery and produce deterministic mismatches in RX and loopback tests.
+
+---
+
+### **Module Overview**
+
+The `uart_rx` block deserializes an **8N1** UART stream into AXI4-Stream bytes using an oversampled, timer-based sampler.
+
+* **Inputs**
+
+  * `clk`, `rst`
+  * `rxd` — asynchronous UART input (idle high)
+  * `m_axis_tready`
+  * `prescale[15:0]` — defines bit period: `T_bit = prescale << 3`
+
+* **Outputs**
+
+  * `m_axis_tdata[DATA_WIDTH-1:0]`, `m_axis_tvalid`
+  * `busy`
+  * `overrun_error` (1-cycle pulse on output back-pressure overrun)
+  * `frame_error` (1-cycle pulse on bad stop interval)
+
+* **Framing**
+
+  * Idle `1` → Start `0` → `DATA_WIDTH` data bits → Stop `1`
+
+---
+
+### **Observed Issues in the RTL**
+
+1. **Inter-bit Sampling Cadence Bug**
+
+   * **What should happen:** After confirming the start bit at ~½-bit delay, reload the sampler so **every subsequent sample** occurs **one bit period** later, near the **bit center**.
+   * **What the RTL does:** Subsequent per-bit samples occur **early by a fixed offset**, especially visible at small `prescale` and around the first data bit.
+   * **Impact:** Early sampling increases susceptibility to edge jitter; stop-bit validation may intermittently fail; RX/loopback mismatches occur.
+
+2. **Bit Reconstruction Order Bug**
+
+   * **What should happen:** Assemble the byte so `m_axis_tdata` reflects the **UART LSB-first** wire order.
+   * **What the RTL does:** The shift direction/orientation reverses the bit order, yielding **bit-reversed bytes**.
+   * **Impact:** Deterministic mismatches even with ideal waveforms.
+
+> Preserve AXI handshake behavior: sticky `m_axis_tvalid` until `m_axis_tready`, single-cycle `overrun_error`/`frame_error`.
+
+---
+
+### **Expected Behavior (post-fix)**
+
+* Uniform one-bit cadence after start confirmation with samples at bit centers.
+* Correct LSB-first byte reconstruction on `m_axis_tdata`.
+* Proper stop interval check; violations assert **`frame_error`** for one cycle.
+* Back-pressure semantics unchanged (`m_axis_tvalid` holds; overrun pulses once).
+
+---
+
+### UART Transmit RTL (`uart_tx`) Bug Fixes
+
+Identify and correct logical bugs in the **UART Transmit RTL (`uart_tx`)** related to **bit ordering**, **stop-bit generation**, and **bit-time reload timing**.
+
+---
+
+### **Module Overview**
+
+The `uart_tx` module serializes AXI4-Stream bytes into an **8N1 UART** frame with a programmable bit time.
+
+* **Inputs**
+
+  * `clk`, `rst`
+  * `s_axis_tdata[DATA_WIDTH-1:0]`, `s_axis_tvalid`
+  * `prescale[15:0]` — `T_bit = prescale << 3`
+
+* **Outputs**
+
+  * `s_axis_tready` — high only when idle (one-beat accept)
+  * `txd` — UART line (idle high)
+  * `busy` — high while a frame is being sent
+
+* **Frame format (8N1)**
+
+  * Idle = `1` → Start = `0` (1 bit) → 8 data bits (LSB-first) → Stop = `1` (1 bit)
+
+---
+
+### **Observed Issues in the RTL**
+
+1. **Bit Ordering Violation**
+
+   * **Expected:** Data bits on `txd` are **LSB-first**.
+   * **Actual:** The current implementation emits the opposite order.
+   * **Impact:** Deterministic mismatches in TX sniffer and loopback.
+
+2. **Stop-Bit Level Violation**
+
+   * **Expected:** Stop interval drives **idle high** for exactly one bit time.
+   * **Actual:** Wrong level on the stop interval.
+   * **Impact:** Framing errors and dropped bytes downstream.
+
+3. **Start-bit duration off by one bit-timer count (reload value) — **[Added detail]**
+
+   * **Expected:** The **start interval** lasts for exactly **`T_bit`** cycles using a down-counter preload of **`T_bit−1`**.
+   * **Actual:** The start path uses a **`T_bit`** preload (one count too long).
+   * **Fix:** When asserting the start bit, reload the bit timer with **`(prescale << 3) - 1`** so the start cell length matches all other symbols.
+
+4. **Per-symbol data/stop reload off by one bit-timer count — **[Added detail]**
+
+   * **Expected:** Each **data** and **stop** symbol is timed by reloading the bit timer to **`T_bit−1`** at the symbol boundary to keep a uniform cadence.
+   * **Actual:** The data/stop path uses **`T_bit`** preload (one count too long), causing a small stretch and center misalignment.
+   * **Fix:** At each data/stop boundary, reload with **`(prescale << 3) - 1`** to keep a uniform per-symbol cadence and mid-bit alignment.
+
+> Keep the **ready-when-idle** handshake policy and overall structure. It’s acceptable to update `txd` and the shifter **atomically** per bit to avoid any off-by-one between the driven bit and the internal position.
+
+---
+
+### **Expected Behavior (post-fix)**
+
+* TX frames on `txd` fully comply with 8N1: correct start/stop levels, **LSB-first** data, and **uniform `T_bit` cadence** for start, each data bit, and stop.
+* `s_axis_tready` asserts only when idle; deasserts on accept; `busy` covers the whole frame.
+
+---
+
+### Deliverables
+
+* Provide **drop-in replacements** for:
+
+  * `rtl\uart_rx.v`
+  * `rtl\uart_tx.v`
+* Keep `rtl\uart.v` unchanged.
+* Add brief comments near changes.
+
+---
+
+### Output:
+
+Please replace with the updated **`rtl\uart_rx.v`** file here.
+
+Please replace with the updated **`rtl\uart_tx.v`** file here.
+
+GPT5 response
+https://chatgpt.com/share/e/69007b96-fe04-8005-a429-b0f6509481ff
