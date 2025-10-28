@@ -6,7 +6,7 @@ services:
     working_dir: /code/rundir/
     command: >
       sh -c "echo 'Compiling...'
-             iverilog -g2012 /code/rtl/*.v /code/verification/test_uart_rx.v
+             iverilog -g2012 /code/rtl/*.v /code/verification/tb_uart_all.v
              echo 'Executing...'
              vvp a.out"
 
